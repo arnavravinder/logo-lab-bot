@@ -145,6 +145,39 @@ def handle_close_voting(ack, body, respond):
     session.commit()
     respond("Voting closed and winner announced.")
 
+@slack_app.command("/make_mod")
+def handle_make_mod(ack, body, respond):
+    ack()
+    user_id = body['user_id']  # The Slack ID of the person who invoked the command
+    text = body.get('text', '').strip()  # The argument passed to /make_mod
+
+    # Check if the user invoking the command is already a moderator
+    invoker = session.query(User).filter_by(slack_id=user_id).first()
+    if not invoker or not invoker.is_moderator:
+        respond("You do not have permission to promote users.")
+        return
+    
+    # Expecting text in the form of "@someone" or "<@U123ABC>"
+    # Let's parse out the Slack user ID:
+    target_slack_id = parse_slack_mention(text)
+    if not target_slack_id:
+        respond("Please mention a valid user to promote. Usage: /make_mod @username")
+        return
+
+    # Check if the target user already exists in the database or create them
+    target_user = session.query(User).filter_by(slack_id=target_slack_id).first()
+    if not target_user:
+        target_user = User(slack_id=target_slack_id, username="Unknown")  # you can store a placeholder
+        session.add(target_user)
+        session.commit()
+    
+    # Set the user as a moderator
+    target_user.is_moderator = True
+    session.commit()
+
+    respond(f"<@{target_slack_id}> is now a moderator!")
+
+
 def start_voting():
     submissions = session.query(Submission).filter_by(is_approved=True).all()
     for submission in submissions:
