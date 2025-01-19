@@ -1,5 +1,5 @@
 import os
-from flask import Flask
+from flask import Flask, request  # <-- Make sure 'request' is imported here
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from dotenv import load_dotenv
@@ -248,13 +248,11 @@ def handle_vote(ack, body):
     session.add(vote)
     session.commit()
     total_votes = session.query(Vote).filter_by(submission_id=submission_id).count()
-    # Attempt to post in the same thread, but if not available, just post in channel
     thread_ts = None
     if "message" in body and body["message"].get("thread_ts"):
         thread_ts = body["message"]["thread_ts"]
     elif "message" in body and body["message"].get("ts"):
         thread_ts = body["message"]["ts"]
-
     slack_app.client.chat_postMessage(
         channel=body["channel"]["id"],
         text=f"Votes: {total_votes}",
@@ -301,6 +299,7 @@ scheduler.add_job(start_voting, 'interval', days=VOTING_DURATION_DAYS)
 
 @app_flask.route("/slack/events", methods=["POST"])
 def slack_events():
+    # use the globally imported `request` from Flask
     return handler.handle(request)
 
 if __name__ == "__main__":
