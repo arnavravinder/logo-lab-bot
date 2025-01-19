@@ -1,58 +1,28 @@
 import os
-from flask import Flask, request  # <-- Make sure 'request' is imported here
+from flask import Flask, request
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, Column, String, Boolean, DateTime, ForeignKey
-from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
+from models import Base, User, Submission, Vote
 import uuid
 
 load_dotenv()
 app_flask = Flask(__name__)
 slack_app = App(token=os.environ['SLACK_BOT_TOKEN'], signing_secret=os.environ['SLACK_SIGNING_SECRET'])
 handler = SlackRequestHandler(slack_app)
-
-Base = declarative_base()
-
-class User(Base):
-    __tablename__ = 'users'
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    slack_id = Column(String, unique=True, nullable=False)
-    username = Column(String, nullable=False)
-    is_moderator = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class Submission(Base):
-    __tablename__ = 'submissions'
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id'))
-    image_url = Column(String, nullable=False)
-    description = Column(String, nullable=False)
-    is_approved = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    thread_ts = Column(String, nullable=True)
-
-class Vote(Base):
-    __tablename__ = 'votes'
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id'))
-    submission_id = Column(UUID(as_uuid=True), ForeignKey('submissions.id'))
-    voted_at = Column(DateTime, default=datetime.utcnow)
-
 engine = create_engine(os.environ['DATABASE_URL'])
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 session = Session()
 scheduler = BackgroundScheduler()
 scheduler.start()
-
 LOGOLAB_CHANNEL_ID = os.environ['LOGOLAB_CHANNEL_ID']
 LOGO_REVIEWS_CHANNEL_ID = os.environ['LOGO_REVIEWS_CHANNEL_ID']
 VOTING_DURATION_DAYS = int(os.environ.get('VOTING_DURATION_DAYS', 30))
-
 MAIN_ADMIN_ID = "U078XLAFNMQ"
 
 def ensure_main_admin(user):
@@ -127,7 +97,8 @@ def handle_approve(ack, body, respond):
     submission.is_approved = True
     session.commit()
     poster = session.query(User).filter_by(id=submission.user_id).first()
-    slack_msg = slack_app.client.chat_postMessage(
+    vote_count = session.query(Vote).filter_by(submission_id=submission.id).count()
+    msg = slack_app.client.chat_postMessage(
         channel=LOGOLAB_CHANNEL_ID,
         text=f"Approved logo by <@{poster.slack_id}>",
         blocks=[
@@ -135,7 +106,7 @@ def handle_approve(ack, body, respond):
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"*Description:*\n{submission.description}\n\n*Submission ID:*\n{submission.id}"
+                    "text": f"*Description:*\n{submission.description}\n\n*Submission ID:*\n{submission.id}\n\n*Votes:* {vote_count}"
                 },
                 "accessory": {
                     "type": "image",
@@ -159,7 +130,8 @@ def handle_approve(ack, body, respond):
             }
         ]
     )
-    submission.thread_ts = slack_msg['ts']
+    submission.thread_ts = msg['ts']
+    submission.message_ts = msg['ts']
     session.commit()
     respond(f"Submission approved and posted to #logo-lab by <@{poster.slack_id}>.")
 
@@ -238,31 +210,50 @@ def handle_vote(ack, body):
     ensure_main_admin(user)
     existing_vote = session.query(Vote).filter_by(user_id=user.id).first()
     if existing_vote:
-        slack_app.client.chat_postEphemeral(
-            channel=body['channel']['id'],
-            user=user_id,
-            text="You have already voted."
-        )
+        slack_app.client.chat_postEphemeral(channel=body['channel']['id'], user=user_id, text="You have already voted.")
         return
     vote = Vote(user_id=user.id, submission_id=submission_id)
     session.add(vote)
     session.commit()
+    slack_app.client.chat_postEphemeral(channel=body['channel']['id'], user=user_id, text="Voted successfully!")
+    submission = session.query(Submission).filter_by(id=submission_id).first()
     total_votes = session.query(Vote).filter_by(submission_id=submission_id).count()
-    thread_ts = None
-    if "message" in body and body["message"].get("thread_ts"):
-        thread_ts = body["message"]["thread_ts"]
-    elif "message" in body and body["message"].get("ts"):
-        thread_ts = body["message"]["ts"]
-    slack_app.client.chat_postMessage(
-        channel=body["channel"]["id"],
-        text=f"Votes: {total_votes}",
-        thread_ts=thread_ts
-    )
+    if submission and submission.message_ts:
+        updated_blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Description:*\n{submission.description}\n\n*Submission ID:*\n{submission.id}\n\n*Votes:* {total_votes}"
+                },
+                "accessory": {
+                    "type": "image",
+                    "image_url": submission.image_url,
+                    "alt_text": "Approved logo"
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Vote"
+                        },
+                        "action_id": "vote",
+                        "value": str(submission.id)
+                    }
+                ]
+            }
+        ]
+        slack_app.client.chat_update(channel=body["channel"]["id"], ts=submission.message_ts, text="Vote Updated", blocks=updated_blocks)
 
 def start_voting():
     submissions = session.query(Submission).filter_by(is_approved=True).all()
     for s in submissions:
-        slack_app.client.chat_postMessage(
+        vote_count = session.query(Vote).filter_by(submission_id=s.id).count()
+        msg = slack_app.client.chat_postMessage(
             channel=LOGOLAB_CHANNEL_ID,
             text="Vote for this logo:",
             blocks=[
@@ -270,7 +261,7 @@ def start_voting():
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*Description:*\n{s.description}\n\n*Submission ID:*\n{s.id}"
+                        "text": f"*Description:*\n{s.description}\n\n*Submission ID:*\n{s.id}\n\n*Votes:* {vote_count}"
                     },
                     "accessory": {
                         "type": "image",
@@ -294,12 +285,20 @@ def start_voting():
                 }
             ]
         )
+        s.thread_ts = msg["ts"]
+        s.message_ts = msg["ts"]
+        session.commit()
 
-scheduler.add_job(start_voting, 'interval', days=VOTING_DURATION_DAYS)
+@scheduler.scheduled_job("interval", days=VOTING_DURATION_DAYS)
+def scheduled_voting():
+    start_voting()
+
+@slack_app.event("message")
+def handle_message_events(body, logger):
+    logger.debug(body)
 
 @app_flask.route("/slack/events", methods=["POST"])
 def slack_events():
-    # use the globally imported `request` from Flask
     return handler.handle(request)
 
 if __name__ == "__main__":
