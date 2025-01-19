@@ -1,5 +1,5 @@
 import os
-from flask import Flask, request
+from flask import Flask
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from dotenv import load_dotenv
@@ -52,6 +52,7 @@ scheduler.start()
 LOGOLAB_CHANNEL_ID = os.environ['LOGOLAB_CHANNEL_ID']
 LOGO_REVIEWS_CHANNEL_ID = os.environ['LOGO_REVIEWS_CHANNEL_ID']
 VOTING_DURATION_DAYS = int(os.environ.get('VOTING_DURATION_DAYS', 30))
+
 MAIN_ADMIN_ID = "U078XLAFNMQ"
 
 def ensure_main_admin(user):
@@ -125,7 +126,6 @@ def handle_approve(ack, body, respond):
         return
     submission.is_approved = True
     session.commit()
-    # Fetch the Slack user who posted this submission
     poster = session.query(User).filter_by(id=submission.user_id).first()
     slack_msg = slack_app.client.chat_postMessage(
         channel=LOGOLAB_CHANNEL_ID,
@@ -226,13 +226,13 @@ def handle_close_voting(ack, body, respond):
     respond("Voting closed and winner announced.")
 
 @slack_app.action("vote")
-def handle_vote(ack, body, respond):
+def handle_vote(ack, body):
     ack()
     user_id = body['user']['id']
     submission_id = body['actions'][0]['value']
     user = session.query(User).filter_by(slack_id=user_id).first()
     if not user:
-        user = User(slack_id=user_id, username=body['user']['username'])
+        user = User(slack_id=user_id, username=body['user'].get('username', 'UnknownUser'))
         session.add(user)
         session.commit()
     ensure_main_admin(user)
@@ -247,12 +247,18 @@ def handle_vote(ack, body, respond):
     vote = Vote(user_id=user.id, submission_id=submission_id)
     session.add(vote)
     session.commit()
-    # Show updated total votes for this submission
     total_votes = session.query(Vote).filter_by(submission_id=submission_id).count()
+    # Attempt to post in the same thread, but if not available, just post in channel
+    thread_ts = None
+    if "message" in body and body["message"].get("thread_ts"):
+        thread_ts = body["message"]["thread_ts"]
+    elif "message" in body and body["message"].get("ts"):
+        thread_ts = body["message"]["ts"]
+
     slack_app.client.chat_postMessage(
-        channel=body['channel']['id'],
-        text=f"<@{user_id}> voted! This submission now has {total_votes} vote(s).",
-        thread_ts=body['message']['thread_ts']
+        channel=body["channel"]["id"],
+        text=f"Votes: {total_votes}",
+        thread_ts=thread_ts
     )
 
 def start_voting():
