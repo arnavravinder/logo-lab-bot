@@ -8,7 +8,6 @@ from sqlalchemy.orm import sessionmaker
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
 from models import Base, User, Submission, Vote
-import uuid
 
 load_dotenv()
 app_flask = Flask(__name__)
@@ -131,7 +130,6 @@ def handle_approve(ack, body, respond):
         ]
     )
     submission.thread_ts = msg['ts']
-    submission.message_ts = msg['ts']
     session.commit()
     respond(f"Submission approved and posted to #logo-lab by <@{poster.slack_id}>.")
 
@@ -218,7 +216,7 @@ def handle_vote(ack, body):
     slack_app.client.chat_postEphemeral(channel=body['channel']['id'], user=user_id, text="Voted successfully!")
     submission = session.query(Submission).filter_by(id=submission_id).first()
     total_votes = session.query(Vote).filter_by(submission_id=submission_id).count()
-    if submission and submission.message_ts:
+    if submission and submission.thread_ts:
         updated_blocks = [
             {
                 "type": "section",
@@ -247,7 +245,12 @@ def handle_vote(ack, body):
                 ]
             }
         ]
-        slack_app.client.chat_update(channel=body["channel"]["id"], ts=submission.message_ts, text="Vote Updated", blocks=updated_blocks)
+        slack_app.client.chat_update(
+            channel=body["channel"]["id"],
+            ts=submission.thread_ts,
+            text="Vote Updated",
+            blocks=updated_blocks
+        )
 
 def start_voting():
     submissions = session.query(Submission).filter_by(is_approved=True).all()
@@ -286,7 +289,6 @@ def start_voting():
             ]
         )
         s.thread_ts = msg["ts"]
-        s.message_ts = msg["ts"]
         session.commit()
 
 @scheduler.scheduled_job("interval", days=VOTING_DURATION_DAYS)
@@ -302,4 +304,5 @@ def slack_events():
     return handler.handle(request)
 
 if __name__ == "__main__":
-    app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))
+    )
