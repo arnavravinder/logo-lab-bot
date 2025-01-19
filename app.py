@@ -52,7 +52,6 @@ scheduler.start()
 LOGOLAB_CHANNEL_ID = os.environ['LOGOLAB_CHANNEL_ID']
 LOGO_REVIEWS_CHANNEL_ID = os.environ['LOGO_REVIEWS_CHANNEL_ID']
 VOTING_DURATION_DAYS = int(os.environ.get('VOTING_DURATION_DAYS', 30))
-
 MAIN_ADMIN_ID = "U078XLAFNMQ"
 
 def ensure_main_admin(user):
@@ -86,11 +85,20 @@ def handle_upload(ack, body, respond):
     slack_app.client.chat_postMessage(
         channel=LOGO_REVIEWS_CHANNEL_ID,
         text=f"New logo submission from <@{user_id}>",
-        attachments=[{
-            "image_url": image_url,
-            "text": description,
-            "footer": f"Submission ID: {submission.id}"
-        }]
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Description:*\n{description}\n\n*Submission ID:*\n{submission.id}"
+                },
+                "accessory": {
+                    "type": "image",
+                    "image_url": image_url,
+                    "alt_text": "Logo submission"
+                }
+            }
+        ]
     )
     respond("Logo submitted for review.")
 
@@ -117,86 +125,43 @@ def handle_approve(ack, body, respond):
         return
     submission.is_approved = True
     session.commit()
-    msg = slack_app.client.chat_postMessage(
+    # Fetch the Slack user who posted this submission
+    poster = session.query(User).filter_by(id=submission.user_id).first()
+    slack_msg = slack_app.client.chat_postMessage(
         channel=LOGOLAB_CHANNEL_ID,
-        text=f"Approved logo by <@{submission.user_id}>",
-        attachments=[{
-            "image_url": submission.image_url,
-            "text": submission.description,
-            "footer": f"Submission ID: {submission.id}",
-            "actions": [{
-                "name": "vote",
-                "text": "Vote",
-                "type": "button",
-                "value": str(submission.id)
-            }]
-        }]
+        text=f"Approved logo by <@{poster.slack_id}>",
+        blocks=[
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Description:*\n{submission.description}\n\n*Submission ID:*\n{submission.id}"
+                },
+                "accessory": {
+                    "type": "image",
+                    "image_url": submission.image_url,
+                    "alt_text": "Approved logo"
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Vote"
+                        },
+                        "action_id": "vote",
+                        "value": str(submission.id)
+                    }
+                ]
+            }
+        ]
     )
-    submission.thread_ts = msg['ts']
+    submission.thread_ts = slack_msg['ts']
     session.commit()
-    respond("Submission approved and posted to #logo-lab.")
-
-@slack_app.command("/close_voting")
-def handle_close_voting(ack, body, respond):
-    ack()
-    user_id = body['user_id']
-    closer = session.query(User).filter_by(slack_id=user_id).first()
-    if not closer:
-        closer = User(slack_id=user_id, username=body['user_name'])
-        session.add(closer)
-        session.commit()
-    ensure_main_admin(closer)
-    if not closer.is_moderator:
-        respond("No permission to close voting.")
-        return
-    submissions = session.query(Submission).filter_by(is_approved=True).all()
-    if not submissions:
-        respond("No approved submissions found.")
-        return
-    vote_counts = {}
-    for s in submissions:
-        count = session.query(Vote).filter_by(submission_id=s.id).count()
-        vote_counts[s.id] = count
-    if not vote_counts:
-        respond("No votes cast.")
-        return
-    winner_id = max(vote_counts, key=vote_counts.get)
-    winner = session.query(Submission).filter_by(id=winner_id).first()
-    slack_app.client.chat_postMessage(
-        channel=LOGOLAB_CHANNEL_ID,
-        text=f"🎉 <@{winner.user_id}>'s logo won with {vote_counts[winner_id]} votes! 🎉"
-    )
-    session.query(Vote).delete()
-    session.commit()
-    respond("Voting closed and winner announced.")
-
-@slack_app.action("vote")
-def handle_vote(ack, body, respond):
-    ack()
-    user_id = body['user']['id']
-    submission_id = body['actions'][0]['value']
-    user = session.query(User).filter_by(slack_id=user_id).first()
-    if not user:
-        user = User(slack_id=user_id, username=body['user']['username'])
-        session.add(user)
-        session.commit()
-    ensure_main_admin(user)
-    existing_vote = session.query(Vote).filter_by(user_id=user.id).first()
-    if existing_vote:
-        slack_app.client.chat_postEphemeral(
-            channel=body['channel']['id'],
-            user=user_id,
-            text="You have already voted."
-        )
-        return
-    vote = Vote(user_id=user.id, submission_id=submission_id)
-    session.add(vote)
-    session.commit()
-    slack_app.client.chat_postMessage(
-        channel=body['channel']['id'],
-        text=f"<@{user_id}> voted.",
-        thread_ts=body['message']['thread_ts']
-    )
+    respond(f"Submission approved and posted to #logo-lab by <@{poster.slack_id}>.")
 
 @slack_app.command("/make_mod")
 def handle_make_mod(ack, body, respond):
@@ -225,22 +190,105 @@ def handle_make_mod(ack, body, respond):
     session.commit()
     respond(f"User <@{target_id}> is now a moderator.")
 
+@slack_app.command("/close_voting")
+def handle_close_voting(ack, body, respond):
+    ack()
+    user_id = body['user_id']
+    closer = session.query(User).filter_by(slack_id=user_id).first()
+    if not closer:
+        closer = User(slack_id=user_id, username=body['user_name'])
+        session.add(closer)
+        session.commit()
+    ensure_main_admin(closer)
+    if not closer.is_moderator:
+        respond("No permission to close voting.")
+        return
+    submissions = session.query(Submission).filter_by(is_approved=True).all()
+    if not submissions:
+        respond("No approved submissions found.")
+        return
+    vote_counts = {}
+    for s in submissions:
+        count = session.query(Vote).filter_by(submission_id=s.id).count()
+        vote_counts[s.id] = count
+    if not vote_counts:
+        respond("No votes cast.")
+        return
+    winner_id = max(vote_counts, key=vote_counts.get)
+    winner = session.query(Submission).filter_by(id=winner_id).first()
+    winning_user = session.query(User).filter_by(id=winner.user_id).first()
+    slack_app.client.chat_postMessage(
+        channel=LOGOLAB_CHANNEL_ID,
+        text=f"🎉 <@{winning_user.slack_id}>'s logo won with {vote_counts[winner_id]} votes! 🎉"
+    )
+    session.query(Vote).delete()
+    session.commit()
+    respond("Voting closed and winner announced.")
+
+@slack_app.action("vote")
+def handle_vote(ack, body, respond):
+    ack()
+    user_id = body['user']['id']
+    submission_id = body['actions'][0]['value']
+    user = session.query(User).filter_by(slack_id=user_id).first()
+    if not user:
+        user = User(slack_id=user_id, username=body['user']['username'])
+        session.add(user)
+        session.commit()
+    ensure_main_admin(user)
+    existing_vote = session.query(Vote).filter_by(user_id=user.id).first()
+    if existing_vote:
+        slack_app.client.chat_postEphemeral(
+            channel=body['channel']['id'],
+            user=user_id,
+            text="You have already voted."
+        )
+        return
+    vote = Vote(user_id=user.id, submission_id=submission_id)
+    session.add(vote)
+    session.commit()
+    # Show updated total votes for this submission
+    total_votes = session.query(Vote).filter_by(submission_id=submission_id).count()
+    slack_app.client.chat_postMessage(
+        channel=body['channel']['id'],
+        text=f"<@{user_id}> voted! This submission now has {total_votes} vote(s).",
+        thread_ts=body['message']['thread_ts']
+    )
+
 def start_voting():
     submissions = session.query(Submission).filter_by(is_approved=True).all()
     for s in submissions:
         slack_app.client.chat_postMessage(
             channel=LOGOLAB_CHANNEL_ID,
             text="Vote for this logo:",
-            attachments=[{
-                "image_url": s.image_url,
-                "text": s.description,
-                "actions": [{
-                    "name": "vote",
-                    "text": "Vote",
-                    "type": "button",
-                    "value": str(s.id)
-                }]
-            }]
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Description:*\n{s.description}\n\n*Submission ID:*\n{s.id}"
+                    },
+                    "accessory": {
+                        "type": "image",
+                        "image_url": s.image_url,
+                        "alt_text": "Submission image"
+                    }
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Vote"
+                            },
+                            "action_id": "vote",
+                            "value": str(s.id)
+                        }
+                    ]
+                }
+            ]
         )
 
 scheduler.add_job(start_voting, 'interval', days=VOTING_DURATION_DAYS)
